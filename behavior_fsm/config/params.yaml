@@ -14,14 +14,14 @@ behavior_fsm:
                                 # CAMBIAR si el robot reacciona en dirección equivocada
 
     # --- Sector frontal de vigilancia ---
-    sector_frontal_deg: 45.0    # +/- grados al frente vigilados
+    sector_frontal_deg: 60.0    # +/- grados al frente vigilados
 
     # --- Sectores laterales (para elegir dirección de rodeo) ---
     sector_lateral_lo:  60.0    # inicio sector lateral [grados]
     sector_lateral_hi: 120.0    # fin sector lateral [grados]
 
     # --- Distancias de reacción ---
-    dist_alerta: 0.45           # m  empieza a frenar progresivamente
+    dist_alerta: 0.55           # m  empieza a frenar progresivamente
     dist_parada: 0.25           # m  para completamente
 
     # --- Velocidades ---
@@ -37,8 +37,11 @@ behavior_fsm:
 
     # --- Gap navigation (evasion dinamica por huecos) ---
     Kgap:           1.2         # rad/s por radian de gap (ganancia de giro hacia el hueco)
-    gap_sector_deg: 90.0        # ventana de busqueda del hueco [+-grados desde el frente]
+    gap_sector_deg: 110.0       # ventana de busqueda del hueco [+-grados desde el frente]
     t_evasion_max:  8.0         # s  timeout de seguridad en estado EVADIR
+
+    # --- Clasificacion esquina (curva de pista) vs obstaculo (caja) ---
+    umbral_caja_deg: 40.0       # deg  ancho angular max de la franja cercana para contar como caja (si es mas ancha, es curva de pista)
 
     # --- Recuperacion (RESCATE: barrido + retroceso si EVADIR se atasca) ---
     topic_odom: '/odom_raw'        # topico de odometria (usar '/odom' si hay EKF)

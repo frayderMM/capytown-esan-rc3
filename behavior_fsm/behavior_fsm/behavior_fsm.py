@@ -35,6 +35,28 @@ EVADIR  = 'EVADIR'
 RESCATE = 'RESCATE'
 
 
+def clasificar_discontinuidad(bucket_min: dict, sector_frontal_deg: float,
+                              umbral_caja_deg: float, dist_alerta: float):
+    """'obstaculo' | 'curva' | None segun el ancho angular de la franja de
+    buckets cercanos (rango < dist_alerta) alrededor del frente.
+
+    Una caja (~20cm) subtiende una franja angosta y aislada; una pared
+    continua doblando en una esquina de pista presenta una franja ancha y
+    gradual, porque la pared no termina, solo cambia de orientación
+    relativa al robot.
+    """
+    if not bucket_min:
+        return None
+    cercanos = sorted(
+        b for b, r in bucket_min.items()
+        if abs(b) <= sector_frontal_deg and r < dist_alerta
+    )
+    if not cercanos:
+        return None
+    ancho_deg = (max(cercanos) - min(cercanos)) + 10.0
+    return 'obstaculo' if ancho_deg <= umbral_caja_deg else 'curva'
+
+
 class BehaviorFSM(Node):
     def __init__(self):
         super().__init__('behavior_fsm')
@@ -54,6 +76,7 @@ class BehaviorFSM(Node):
         self.declare_parameter('gap_sector_deg',       90.0)  # ventana de busqueda del hueco
         self.declare_parameter('t_evasion_max',        8.0)   # timeout de seguridad
         self.declare_parameter('dist_emergencia',      0.12)  # stop total si algo esta a < X m
+        self.declare_parameter('umbral_caja_deg',      40.0)  # deg  ancho max de franja cercana = caja
 
         # --- Recuperacion (RESCATE: barrido + retroceso si EVADIR se atasca) ---
         self.declare_parameter('topic_odom',                '/odom_raw')
@@ -66,6 +89,7 @@ class BehaviorFSM(Node):
         self.declare_parameter('dist_seguridad_retroceso',      0.20)
 
         self.front_rad  = math.radians(self.get_parameter('lidar_front_deg').value)
+        self.sector_frontal_deg_val = self.get_parameter('sector_frontal_deg').value  # grados, crudo (para clasificar_discontinuidad)
         self.sector     = math.radians(self.get_parameter('sector_frontal_deg').value)
         self.lat_lo     = math.radians(self.get_parameter('sector_lateral_lo').value)
         self.lat_hi     = math.radians(self.get_parameter('sector_lateral_hi').value)
@@ -79,6 +103,7 @@ class BehaviorFSM(Node):
         self.gap_sector = math.radians(self.get_parameter('gap_sector_deg').value)
         self.t_ev_max   = self.get_parameter('t_evasion_max').value
         self.d_emerg    = self.get_parameter('dist_emergencia').value
+        self.umbral_caja_deg = self.get_parameter('umbral_caja_deg').value
 
         self.topic_odom    = self.get_parameter('topic_odom').value
         self.gap_fallback  = math.radians(self.get_parameter('gap_fallback_deg').value)
@@ -99,6 +124,7 @@ class BehaviorFSM(Node):
         self.dist_der    = float('inf')
         self.dist_atras  = float('inf')
         self._gap_ang    = 0.0   # ángulo al mayor espacio abierto
+        self._bucket_min = {}    # rango minimo por bucket de 10°, para clasificar curva/obstaculo
         self._w_lateral  = 0.0
 
         # ── Odometría (para RESCATE) ─────────────────────────────────────
@@ -134,6 +160,7 @@ class BehaviorFSM(Node):
         # Para el hueco: acumular rangos por bucket de 10°
         bucket_sum   = {}
         bucket_count = {}
+        bucket_min   = {}
 
         for i, r in enumerate(msg.ranges):
             raw    = msg.angle_min + i * msg.angle_increment
@@ -165,11 +192,13 @@ class BehaviorFSM(Node):
                 bucket = round(math.degrees(af) / 10.0) * 10
                 bucket_sum[bucket]   = bucket_sum.get(bucket, 0.0) + r_gap
                 bucket_count[bucket] = bucket_count.get(bucket, 0) + 1
+                bucket_min[bucket]   = min(bucket_min.get(bucket, msg.range_max), r_gap)
 
         self.dist_frente = d_f
         self.dist_izq    = d_l
         self.dist_der    = d_r
         self.dist_atras  = d_b
+        self._bucket_min = bucket_min
 
         # Hueco = bucket con mayor rango promedio dentro de la ventana
         if bucket_count:
@@ -239,6 +268,15 @@ class BehaviorFSM(Node):
 
         if self.estado == CRUCERO:
             if self.dist_frente <= self.d_parada:
+                clase = clasificar_discontinuidad(
+                    self._bucket_min, self.sector_frontal_deg_val,
+                    self.umbral_caja_deg, self.d_alerta)
+                if clase == 'curva':
+                    # Esquina normal de la pista (pared continua doblando),
+                    # no una caja — confiar en el seguimiento de pared
+                    # derecha (_w_lateral) en vez de parar y evadir.
+                    self._pub(self._vel_adaptativa(), self._w_lateral)
+                    return
                 d_msg = Float32(); d_msg.data = float(self.dist_frente)
                 self.pub_parada.publish(d_msg)
                 self._cambiar(PARAR)
