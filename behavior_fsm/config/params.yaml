@@ -18,7 +18,7 @@ behavior_fsm:
 
     # --- Sectores laterales (para elegir dirección de rodeo) ---
     sector_lateral_lo:  60.0    # inicio sector lateral [grados]
-    sector_lateral_hi: 120.0    # fin sector lateral [grados]
+    sector_lateral_hi:  90.0    # fin sector lateral [grados] — tope en 90 = mitad delantera del LiDAR (la logica de avance solo usa la mitad de adelante)
 
     # --- Distancias de reacción ---
     dist_alerta: 0.55           # m  empieza a frenar progresivamente
@@ -37,17 +37,19 @@ behavior_fsm:
 
     # --- Gap navigation (evasion dinamica por huecos) ---
     Kgap:           1.2         # rad/s por radian de gap (ganancia de giro hacia el hueco)
-    gap_sector_deg: 110.0       # ventana de busqueda del hueco [+-grados desde el frente]
+    gap_sector_deg: 90.0        # ventana de busqueda del hueco [+-grados desde el frente]
     t_evasion_max:  8.0         # s  timeout de seguridad en estado EVADIR
 
     # --- Clasificacion esquina (curva de pista) vs obstaculo (caja) ---
     umbral_caja_deg: 40.0       # deg  ancho angular max de la franja cercana para contar como caja (si es mas ancha, es curva de pista)
 
+    # --- Giro de esquina dedicado (curva de pista, no caja) ---
+    giro_esquina_t_max:  4.0    # s    limite de seguridad (reloj) para el giro de esquina — sale antes por LiDAR (frente despejado)
+
     # --- Recuperacion (RESCATE: barrido + retroceso si EVADIR se atasca) ---
-    topic_odom: '/odom_raw'        # topico de odometria (usar '/odom' si hay EKF)
+    topic_odom: '/odom_raw'        # topico de odometria (usado SOLO para posicion en RETROCEDER)
     gap_fallback_deg: 15.0         # deg  margen para usar fallback lateral en EVADIR
-    barrido_max_deg: 300.0         # deg  giro acumulado max en fase BARRIDO antes de retroceder
-    barrido_t_max: 10.0            # s    limite de seguridad (reloj) para fase BARRIDO
+    barrido_t_max: 10.0            # s    tope de tiempo en fase BARRIDO — sale antes por LiDAR (frente despejado)
     vel_retroceso: 0.08            # m/s  velocidad de reversa en RETROCEDER
     retroceso_dist: 0.25           # m    distancia objetivo de reversa
     retroceso_t_max: 3.0           # s    limite de seguridad (reloj) para RETROCEDER
@@ -56,7 +58,7 @@ behavior_fsm:
 wall_follower:
   ros__parameters:
     # --- Control lateral ---
-    dist_objetivo:  0.18        # m    distancia deseada a la pared DERECHA (jiron de 60cm de ancho — ajustar en pista real)
+    dist_objetivo:  0.50        # m    distancia deseada a la pared DERECHA (revertido — el hug ajustado dejaba muy poco margen, ajustar con cuidado en pista real)
     Kp:             0.80        # ganancia proporcional
     Kd:             0.10        # ganancia derivativa
     max_correccion: 0.40        # rad/s  saturación de salida

@@ -29,10 +29,11 @@ from std_msgs.msg import Float32, String
 from box_detector import lidar_utils as lu
 
 
-CRUCERO = 'CRUCERO'
-PARAR   = 'PARAR'
-EVADIR  = 'EVADIR'
-RESCATE = 'RESCATE'
+CRUCERO      = 'CRUCERO'
+PARAR        = 'PARAR'
+EVADIR       = 'EVADIR'
+RESCATE      = 'RESCATE'
+GIRO_ESQUINA = 'GIRO_ESQUINA'
 
 
 def clasificar_discontinuidad(bucket_min: dict, sector_frontal_deg: float,
@@ -65,7 +66,7 @@ class BehaviorFSM(Node):
         self.declare_parameter('lidar_front_deg',    180.0)
         self.declare_parameter('sector_frontal_deg',  45.0)
         self.declare_parameter('sector_lateral_lo',   60.0)
-        self.declare_parameter('sector_lateral_hi',  120.0)
+        self.declare_parameter('sector_lateral_hi',   90.0)  # tope en 90 = mitad delantera del LiDAR
         self.declare_parameter('dist_alerta',          0.45)
         self.declare_parameter('dist_parada',          0.18)
         self.declare_parameter('vel_crucero',          0.18)
@@ -73,15 +74,15 @@ class BehaviorFSM(Node):
         self.declare_parameter('vel_giro',             0.50)
         self.declare_parameter('pausa_parada',         0.30)
         self.declare_parameter('Kgap',                 1.2)   # rad/s por radian de gap
-        self.declare_parameter('gap_sector_deg',       90.0)  # ventana de busqueda del hueco
+        self.declare_parameter('gap_sector_deg',       90.0)  # ventana de busqueda del hueco (medio-angulo directo — no exceder ~90)
         self.declare_parameter('t_evasion_max',        8.0)   # timeout de seguridad
         self.declare_parameter('dist_emergencia',      0.12)  # stop total si algo esta a < X m
         self.declare_parameter('umbral_caja_deg',      40.0)  # deg  ancho max de franja cercana = caja
+        self.declare_parameter('giro_esquina_t_max',    4.0)  # s    limite de seguridad del giro de esquina
 
         # --- Recuperacion (RESCATE: barrido + retroceso si EVADIR se atasca) ---
         self.declare_parameter('topic_odom',                '/odom_raw')
         self.declare_parameter('gap_fallback_deg',           15.0)
-        self.declare_parameter('barrido_max_deg',            300.0)
         self.declare_parameter('barrido_t_max',               10.0)
         self.declare_parameter('vel_retroceso',                0.08)
         self.declare_parameter('retroceso_dist',               0.25)
@@ -104,10 +105,10 @@ class BehaviorFSM(Node):
         self.t_ev_max   = self.get_parameter('t_evasion_max').value
         self.d_emerg    = self.get_parameter('dist_emergencia').value
         self.umbral_caja_deg = self.get_parameter('umbral_caja_deg').value
+        self.giro_esquina_t_max = self.get_parameter('giro_esquina_t_max').value
 
         self.topic_odom    = self.get_parameter('topic_odom').value
         self.gap_fallback  = math.radians(self.get_parameter('gap_fallback_deg').value)
-        self.barrido_max   = math.radians(self.get_parameter('barrido_max_deg').value)
         self.barrido_t_max = self.get_parameter('barrido_t_max').value
         self.vel_retroceso = self.get_parameter('vel_retroceso').value
         self.retroceso_dist = self.get_parameter('retroceso_dist').value
@@ -134,17 +135,18 @@ class BehaviorFSM(Node):
         # ── Sub-estado de RESCATE ────────────────────────────────────────
         self._rescate_fase        = None   # 'BARRIDO' | 'RETROCEDER' | None
         self._rescate_sentido     = 0      # +1/-1, sentido de giro en BARRIDO
-        self._rescate_yaw_prev    = 0.0
-        self._rescate_yaw_acum    = 0.0
         self._rescate_xy0         = (0.0, 0.0)
         self._rescate_fase_t0     = self.get_clock().now()
+
+        # ── Giro de esquina dedicado ──────────────────────────────────────
+        self._giro_sentido = 0   # +1/-1, sentido de giro en GIRO_ESQUINA
 
         # ── ROS I/O ───────────────────────────────────────────────────────
         _qos = QoSProfile(depth=10)
         _qos.reliability = ReliabilityPolicy.BEST_EFFORT
         self.create_subscription(LaserScan, '/scan',               self.cb_scan, _qos)
         self.create_subscription(Float32,   '/lateral_correction', self._cb_lat,  10)
-        self.create_subscription(Odometry,  self.topic_odom,       self.cb_odom,  10)
+        self.create_subscription(Odometry,  self.topic_odom,       self.cb_odom,  _qos)
         self.pub_cmd    = self.create_publisher(Twist,   '/cmd_vel',     10)
         self.pub_estado = self.create_publisher(String,  '/fsm_state',   10)
         self.pub_parada = self.create_publisher(Float32, '/parada_dist', 10)
@@ -217,6 +219,13 @@ class BehaviorFSM(Node):
 
     # ── Helpers ───────────────────────────────────────────────────────────
     def _pub(self, v: float, w: float):
+        if self.dist_frente < self.d_emerg:
+            # Nunca empujar hacia el obstaculo frontal — pero el giro (y el
+            # retroceso, v ya negativo) se dejan pasar, para que RESCATE o
+            # GIRO_ESQUINA puedan seguir intentando escapar. Bloquear todo
+            # aqui dejaria al robot congelado para siempre si el frente
+            # nunca se libera solo.
+            v = min(v, 0.0)
         cmd = Twist()
         cmd.linear.x  = float(v)
         cmd.angular.z = float(w)
@@ -244,10 +253,11 @@ class BehaviorFSM(Node):
         return (self.get_clock().now() - self._rescate_fase_t0).nanoseconds * 1e-9
 
     def _iniciar_barrido(self):
-        self._rescate_sentido  = 1.0 if self.dist_izq >= self.dist_der else -1.0
-        self._rescate_yaw_prev = self.pose[2]
-        self._rescate_yaw_acum = 0.0
+        self._rescate_sentido = 1.0 if self.dist_izq >= self.dist_der else -1.0
         self._cambiar_fase_rescate('BARRIDO')
+
+    def _iniciar_giro_esquina(self):
+        self._giro_sentido = 1.0 if self.dist_izq >= self.dist_der else -1.0
 
     def _vel_adaptativa(self) -> float:
         d = self.dist_frente
@@ -259,28 +269,33 @@ class BehaviorFSM(Node):
     # ── FSM principal ─────────────────────────────────────────────────────
     def loop_control(self):
 
-        # Contingencia de colisión — override de cualquier estado
+        # Contingencia de colisión — bloquea el avance en cualquier estado
+        # (ver _pub: nunca empuja hacia el frente), pero NO corta el giro,
+        # para que el estado activo (RESCATE/GIRO_ESQUINA) pueda seguir
+        # intentando escapar en vez de quedar congelado para siempre.
         if self.dist_frente < self.d_emerg:
             self.get_logger().warn(
-                f'EMERGENCIA frente={self.dist_frente:.2f}m — stop total', throttle_duration_sec=1.0)
-            self._pub(0.0, 0.0)
-            return
+                f'EMERGENCIA frente={self.dist_frente:.2f}m — avance bloqueado, giro permitido',
+                throttle_duration_sec=1.0)
 
         if self.estado == CRUCERO:
-            if self.dist_frente <= self.d_parada:
+            if self.dist_frente <= self.d_alerta:
                 clase = clasificar_discontinuidad(
                     self._bucket_min, self.sector_frontal_deg_val,
                     self.umbral_caja_deg, self.d_alerta)
                 if clase == 'curva':
-                    # Esquina normal de la pista (pared continua doblando),
-                    # no una caja — confiar en el seguimiento de pared
-                    # derecha (_w_lateral) en vez de parar y evadir.
-                    self._pub(self._vel_adaptativa(), self._w_lateral)
+                    # Esquina de pista (pared continua doblando), no una
+                    # caja — maniobra de giro dedicada (gradual, avanzando
+                    # mientras gira), no confiar en el PD lateral que no
+                    # alcanza a tomar 90° en un corredor angosto.
+                    self._cambiar(GIRO_ESQUINA)
+                    self._iniciar_giro_esquina()
                     return
-                d_msg = Float32(); d_msg.data = float(self.dist_frente)
-                self.pub_parada.publish(d_msg)
-                self._cambiar(PARAR)
-                return
+                if self.dist_frente <= self.d_parada:
+                    d_msg = Float32(); d_msg.data = float(self.dist_frente)
+                    self.pub_parada.publish(d_msg)
+                    self._cambiar(PARAR)
+                    return
             v = self._vel_adaptativa()
             w = self._w_lateral if self.dist_frente >= self.d_alerta else 0.0
             self._pub(v, w)
@@ -326,14 +341,25 @@ class BehaviorFSM(Node):
         elif self.estado == RESCATE:
             self._loop_rescate()
 
-    # ── RESCATE: barrido activo (odometría) + retroceso controlado ─────────
-    def _loop_rescate(self):
-        if not self.tengo_odom:
-            # Sin odometría no se puede medir giro/desplazamiento con
-            # seguridad — esperar en el sitio en vez de mover a ciegas.
-            self._pub(0.0, 0.0)
+        elif self.estado == GIRO_ESQUINA:
+            self._loop_giro_esquina()
+
+    # ── GIRO_ESQUINA: gira avanzando (graduado, nunca sobre sí mismo) ──────
+    def _loop_giro_esquina(self):
+        # Salida por LiDAR (frente despejado = ya doblamos lo suficiente)
+        # con tope de tiempo como respaldo — no usa odometria, el yaw por
+        # rueda acumula drift y el LiDAR ya observa la pared en vivo.
+        if self.dist_frente > self.d_alerta or self._t_estado() >= self.giro_esquina_t_max:
+            self._cambiar(CRUCERO)
             return
 
+        self._pub(self._vel_adaptativa(), self._giro_sentido * self.w_giro)
+
+    # ── RESCATE: barrido activo (odometría) + retroceso controlado ─────────
+    def _loop_rescate(self):
+        # BARRIDO no necesita odometria (solo LiDAR + tiempo). Solo
+        # RETROCEDER la necesita, para medir cuanto se ha desplazado —
+        # ese chequeo vive en _rescate_barrido, al decidir si transicionar.
         if self._rescate_fase == 'BARRIDO':
             self._rescate_barrido()
         elif self._rescate_fase == 'RETROCEDER':
@@ -345,26 +371,19 @@ class BehaviorFSM(Node):
     def _rescate_barrido(self):
         # Apertura real encontrada (cb_scan se sigue actualizando mientras
         # el robot gira) → volver a EVADIR para reincorporarse con el
-        # control proporcional normal.
+        # control proporcional normal. Salida por LiDAR + tope de tiempo —
+        # sin yaw de odometria, igual que GIRO_ESQUINA.
         if self.dist_frente > self.d_alerta:
             self._cambiar(EVADIR)
             return
 
-        # Acumular rotación real recorrida (delta por-tick, no contra una
-        # referencia fija — atan2 envuelve a [-pi,pi] y subestimaría giros
-        # de mas de 180°).
-        yaw_actual = self.pose[2]
-        d_yaw = math.atan2(math.sin(yaw_actual - self._rescate_yaw_prev),
-                           math.cos(yaw_actual - self._rescate_yaw_prev))
-        self._rescate_yaw_acum += abs(d_yaw)
-        self._rescate_yaw_prev = yaw_actual
-
-        if (self._rescate_yaw_acum >= self.barrido_max
-                or self._t_fase_rescate() >= self.barrido_t_max):
-            # Barrido agotado sin encontrar apertura → intentar retroceder.
-            if self.dist_atras < self.dist_seg_retro:
+        if self._t_fase_rescate() >= self.barrido_t_max:
+            # Barrido agotado sin encontrar apertura → intentar retroceder,
+            # solo si atras esta libre Y hay posicion (odometria) para
+            # medir el retroceso con seguridad.
+            if self.dist_atras < self.dist_seg_retro or not self.tengo_odom:
                 self.get_logger().warn(
-                    'RESCATE: barrido agotado y atras tambien bloqueado — reintentando barrido')
+                    'RESCATE: barrido agotado — reintentando (atras bloqueado o sin posicion)')
                 self._iniciar_barrido()
                 return
             self._rescate_xy0 = (self.pose[0], self.pose[1])
